@@ -1416,6 +1416,7 @@ name        = "receive-only-ephemeral"
 outbound    = false        # no EmailSubmission, no outbound channel plugin
 storage     = "ephemeral"  # metadata=in-memory+TTL, blob=null, index=off
 retention   = "60s"        # TTL for the forgettable metadata role
+journal     = "durable"    # intake journal stays durable (default) — see below
 ```
 
 On startup the engine asserts:
@@ -1428,6 +1429,26 @@ On startup the engine asserts:
   send" — which no single setting otherwise states.
 - _The storage role binding matches an ephemeral implementation_, so
   "forgettable" is a checked property, not an accident.
+
+== Forgettable applies to content, never to the intake journal
+"Ephemeral storage" forgets message _content_; it must _not_ forget the
+intake journal (§Durability & Crash Recovery), or the profile loses its
+crash/outage guarantee — a momentarily-down interceptor or a restart
+would lose mail. So the profile carries `journal` as a separate dial,
+independent of `storage`:
+
+- `journal = durable` (default) — _perfect sync_: survives crash and
+  plugin downtime, exactly-once notification, at the cost of durable
+  content-free fingerprints of every message (incl. dropped ones).
+- `journal = none` — _true zero retention_, RAM-everything, at the cost of
+  at-most-once delivery (a crash may lose in-flight mail or double-fire).
+
+The default is `durable`: a receive-only sink almost always wants "even if
+the server blips, we did not lose or double-process mail" more than it
+wants to forget that a message _existed_. Zero-retention is the knowing
+opt-in for the rare maximally-private case. The two are genuinely
+exclusive — the journal is what makes sync perfect, and it is itself the
+one (small, content-free) thing retained.
 
 == Forgettable storage changes three semantics — state them, don't hide them
 A forgettable store quietly inverts guarantees the rest of the design
@@ -1989,3 +2010,8 @@ express all of these cleanly is wrong.
   finalize), and the perfect-sync-vs-zero-retention dial
   (`journal = durable` default; the journal stays durable even when
   content is forgettable).
+- *2026-06-09* — Reconciled Deployment Profiles with durability: added the
+  `journal` dial (default `durable`) as a separate axis from `storage`,
+  and stated that "forgettable" forgets content but never the intake
+  journal — otherwise the receive-only profile loses its crash/outage
+  no-loss guarantee.
