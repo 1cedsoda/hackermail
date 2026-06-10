@@ -1094,17 +1094,50 @@ content-addressed blob store for `Email` bodies. Postgres, S3,
 FoundationDB, a CRDT store, or even IMAP-as-backing-store must all be
 possible implementations.
 
+== Four storage roles, not one
+"Storage is a plugin" is too coarse. Storage is really _four_ roles with
+different durability, latency, and size profiles, each independently
+swappable (a pattern Stalwart proves in production — see §Prior Art).
+Splitting them is what lets "encrypted bodies in S3, state in SQLite,
+index in Elasticsearch, hot cache in Redis" fall out without special
+cases — and, crucially for us, what lets "forgettable" _compose_ rather
+than being a fifth monolithic store.
+
+#table(
+  columns: (auto, 1fr, 1fr),
+  align: (left, left, left),
+  stroke: 0.5pt + luma(180),
+  table.header[*Role*][*Holds*][*Forgettable variant*],
+  [`metadata`], [`EmailObject`, `Mailbox`, flags, `ext` namespaces, the changelog.], [in-memory, TTL-evicted],
+  [`blob`], [Immutable `Email.raw` + attachments, content-addressed.], [null (drop after fanout) / TTL],
+  [`index`], [Inverted full-text index.], [disabled (no index)],
+  [`cache`], [Hot derived state, decrypted-view TTL cache, sessions.], [in-memory (already ephemeral)],
+)
+
+Content addressing is by hash of `Email.raw`; we specify SHA-256 in
+§Identity for `rawHash`, but for the blob-store _key_ a faster 256-bit
+hash (e.g. BLAKE3) is equally valid — it is an address, not a signature.
+Implementations may use either as long as `rawHash` itself stays
+SHA-256 for the cross-system identity guarantee.
+
+== The changelog is a storage role concern
+The sync changelog (§State tokens & sync) is a first-class, range-scannable
+partition of the `metadata` role — keyed `(accountId, collection,
+changeId)`. A storage plugin must expose it as such; a forgettable store
+keeps only a bounded tail (the retention window), which is what couples
+the TTL to the idempotency and replay horizons (§Deployment Profiles).
+
 == Indexing
-A query plugin owns the inverted index. Encrypted bodies are opaque
-unless the user supplies a per-account key to a privileged search plugin
-(future capability). Header-level and metadata-level search work even
-when bodies are encrypted.
+A query plugin owns the inverted index (the `index` role above).
+Encrypted bodies are opaque unless the user supplies a per-account key
+to a privileged search plugin (future capability). Header-level and
+metadata-level search work even when bodies are encrypted.
 
 == Sync model
 We adopt JMAP's _state token_ pattern: every queryable type exposes a
-monotonic state token; clients and plugins pull deltas. Webhooks
-complement this for push, but the state token is the source of truth for
-"did I miss anything".
+monotonic state token; clients and plugins pull deltas (mechanism in
+§State tokens & sync). Webhooks complement this for push, but the state
+token is the source of truth for "did I miss anything".
 
 = Routing & Multiplexing
 
@@ -1455,3 +1488,9 @@ express all of these cleanly is wrong.
   mapped onto the `Email`/`EmailObject` split, and the upward-vs-downward
   two-boundary framing (client-as-server, not MTA). Adapted from
   Stalwart's change-id machinery.
+- *2026-06-09* — Split storage into four roles (`metadata`, `blob`,
+  `index`, `cache`), each independently swappable with a named
+  forgettable variant, so "forgettable storage" composes instead of being
+  monolithic. Made the changelog an explicit partition of the `metadata`
+  role. Noted BLAKE3 as an acceptable blob-key hash (address, not
+  signature). Adapted from Stalwart's store/blob/search/in-memory split.
