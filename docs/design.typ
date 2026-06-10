@@ -1150,7 +1150,7 @@ than being a fifth monolithic store.
   table.header[*Role*][*Holds*][*Forgettable variant*],
   [`metadata`], [`EmailObject`, `Mailbox`, flags, `ext` namespaces, the changelog.], [in-memory, TTL-evicted],
   [`blob`], [Immutable `Email.raw` + attachments, content-addressed.], [null (drop after fanout) / TTL],
-  [`index`], [Inverted full-text index.], [disabled (no index)],
+  [`index`], [_Index Providers_: inverted FTS, vector/ANN, faceted, … (see below).], [disabled (no index)],
   [`cache`], [Hot derived state, decrypted-view TTL cache, sessions.], [in-memory (already ephemeral)],
 )
 
@@ -1167,11 +1167,74 @@ changeId)`. A storage plugin must expose it as such; a forgettable store
 keeps only a bounded tail (the retention window), which is what couples
 the TTL to the idempotency and replay horizons (§Deployment Profiles).
 
-== Indexing
-A query plugin owns the inverted index (the `index` role above).
-Encrypted bodies are opaque unless the user supplies a per-account key
-to a privileged search plugin (future capability). Header-level and
-metadata-level search work even when bodies are encrypted.
+== Index Providers (one role, many instances)
+Full-text search and AI embeddings are not two features — they are two
+_instances_ of one shape: a derived, queryable projection of email content
+that is not canonical state. Rather than special-case each, the `index`
+role is an *Index Provider* contract, and FTS, vector/ANN, faceted,
+language-detect, near-duplicate clustering, etc. all plug in as instances
+with no core changes. The contract is small:
+
+```
+index.analyzeSchema()       → declares the filter operators + sort keys
+                              this provider can satisfy
+index.upsert(analyzedDoc)   → build/refresh structure for one Email
+index.delete(emailId)       → cascade on expunge/forget
+index.query(subFilter)      → return ids WITH per-provider scores
+```
+
+A provider _declares the operators it satisfies_ (`text`, `phrase`,
+`semanticNear`, `hasAttachment`, `lang`, range, …). That declaration is
+how the engine routes queries without hardcoding knowledge of FTS or
+vector — and the operators are capability-namespaced (§API Surface), so
+they are gated by `using` just like crypto methods.
+
+Why this is not an `ext` namespace: a derived index is large and exists to
+be queried by its _own_ structure (an inverted index, an HNSW/IVF graph),
+not returned inline with `Email/get`. `ext` blobs ride along with every
+read; index structures must not.
+
+== Vector/embedding providers, specifically
+The embedding case is just a vector Index Provider. Two model-specific
+rules it adds:
+
+- *Multiple embeddings per email, keyed `(model, version, scope, chunkId)`.*
+  Vectors from different models occupy different geometric spaces and are
+  not comparable, so a query targets exactly one `(model, scope)` space;
+  long emails chunk into many vectors (RAG); model upgrades version-bump
+  and backfill before GC of the old space. One `Email` therefore carries
+  many embeddings by design.
+- *Content-shared, account-scoped.* The vector is a pure function of
+  `(content projection, model, version)`, so it is content-addressed and
+  computed once per `Email`, shared across every account that received the
+  message — while _index membership_ stays per-account. Identical to how
+  FTS body-tokenization is content-derived but the search index is
+  per-account. A small descriptor under `ext.hackermail.embedding`
+  (`[{model, dim, version, scope, vectorRef}]`) lets UIs/agents discover
+  _which_ embeddings exist without moving vectors; the vectors live in the
+  index role, referenced by id (exactly how attachments reference blobs).
+
+== One lifecycle, defined once on the role
+All Index Providers share an operational lifecycle, specified once so no
+instance reinvents it:
+- *Backfill* on registration (new provider walks the corpus).
+- *Incremental* update on `email.analyzed` / `emailObject.changed`.
+- *Deletion cascade* on `expunge` / forget.
+- *Reindex* on analyzer/model version bump (version-in-key, dual-read
+  during backfill).
+- *Capability gate* for encrypted content (§Crypto) — one rule, every
+  provider.
+- *Forgettable profile* — provider holds its structure in its _own_
+  external store; the engine retains nothing.
+- *Degraded mode* — a provider that is down returns `pluginUnavailable`
+  for its operators; the planner drops or fails those predicates per
+  policy while other predicates still resolve (the "never block on
+  optional plugins" rule, applied to search).
+
+Header-level and metadata-level filters are always served by the
+`metadata` role's own secondary indexes and work even when bodies are
+encrypted or unindexed; Index Providers are _additional, optional_
+projections layered on top.
 
 == Sync model
 We adopt JMAP's _state token_ pattern: every queryable type exposes a
@@ -1698,3 +1761,11 @@ express all of these cleanly is wrong.
   resolution), and the downward-reconciliation asymmetry that is ours
   alone. Retired the resolved open questions (event-bus topology, hot
   reload, webhook backpressure).
+- *2026-06-09* — Recast the `index` storage role into an *Index Provider*
+  contract: FTS, vector/ANN, faceted, etc. as instances of one shape, each
+  declaring the (capability-namespaced) operators it satisfies and
+  returning ids _with scores_. Specified the vector/embedding instance
+  (multiplicity keyed `(model, version, scope, chunkId)`, content-shared +
+  account-scoped, `ext.hackermail.embedding` descriptor) and a single
+  shared provider lifecycle (backfill/incremental/delete/reindex/gate/
+  forgettable/degraded).
