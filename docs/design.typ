@@ -709,10 +709,85 @@ accountIds, mailboxIds }`).
 == State tokens & sync
 Every typed result carries a `state` field; clients pass it back to
 `changes` / `queryChanges` to receive deltas. State tokens are opaque
-strings (we use `"<timestamp>/<sequence>"` internally; clients must not
-parse them). A client that never sees push can poll `changes`; a client
-that subscribes to push uses tokens for catch-up after disconnect.
-Webhooks are best-effort; tokens are authoritative.
+strings (clients must not parse them). A client that never sees push can
+poll `changes`; a client that subscribes to push uses tokens for catch-up
+after disconnect. Webhooks are best-effort; tokens are authoritative.
+
+This is the engine's _upward_ sync boundary (engine → UI clients / agents).
+As a client-as-server, keeping clients coherent is the engine's core job,
+so the mechanism is worth pinning down concretely rather than leaving as
+"opaque string". We adopt the shape proven by Stalwart (see §Prior Art):
+
+- *Change-id.* A monotonically increasing `u64` counter per
+  `(account, collection)`. Every mutation bumps it; it never moves
+  backward. A `state` token is just the current value of this counter,
+  rendered opaque to the client.
+- *Changelog.* An append-only log of change records keyed by
+  `(accountId, collection, changeId)`, so a `changes` call is a range
+  scan from the client's last-seen id forward — not a re-scan of the
+  whole collection. Storage plugins expose this as a first-class subspace
+  (see §Storage); a forgettable store keeps only a bounded tail of it
+  (see §Deployment Profiles).
+- A change record carries `{ changeId, collection, entityId, op:
+  created|updated|destroyed, provenance }`. Provenance is the same
+  structured record required everywhere else (§Provenance) — the
+  changelog is _why-aware_, which is what makes a diverging sync
+  debuggable.
+
+== The `changes` round-trip (worked)
++ Client fetches its inbox; engine returns the data plus `state="42"`.
+  The client stashes `42`.
++ A _different_ client (the user's phone) flags one email and archives
+  another. The engine appends change records `43` and `44`, bumping the
+  account's `EmailObject` counter to `44`.
++ The first client reconnects and calls `changes(since: "42")`. The
+  engine range-scans the changelog from `43`, returns "these two
+  `EmailObject`s changed" plus `state="44"`.
++ The client fetches _only those two_ rows, never the whole inbox.
+
+== `assert_state` — optimistic concurrency
+Writes carry the client's base state. An `EmailObject/set` says, in
+effect, "I am acting on state `44`". If a concurrent mutation already
+advanced the counter to `45`, the engine rejects the write with
+`stateMismatch` (§Error model) — "you are working from stale data,
+re-sync first" — instead of silently clobbering. This is the mechanism
+that _produces_ the `stateMismatch` code: every `set` asserts the caller's
+base state at the envelope boundary before any write commits.
+
+== Container vs. item change streams
+"Changed" is not one stream but two, tracked under separate change-ids,
+because the two kinds of state churn at wildly different rates:
+
+- *Item changes* — individual `EmailObject` mutations (flag, move). High
+  volume, constant.
+- *Container changes* — `Mailbox` create / rename / membership. Rare.
+
+Splitting them lets a client subscribe to item changes without being
+woken for every mailbox rename, and lets the engine serve a cheap
+"anything structural changed?" check. This split is not incidental: it
+lands exactly on our `Email` (immutable, content-addressed, almost never
+changes) vs. `EmailObject` (per-account mutable state, churns constantly)
+division from §Domain Model. The high-churn item stream _is_
+`EmailObject`; `Email` rows barely move. The seam we drew for storage and
+crypto reasons turns out to be the right seam for sync too.
+
+== Two boundaries, not one
+A full mail server (an MTA) is the _source of truth_ and has a single
+sync boundary: push changes up to clients. We are a client-as-server —
+a projection of _other_ sources of truth (the providers) — so we have
+_two_ boundaries, and they are asymmetric:
+
+- *Upward* (engine → UI clients): identical to an MTA's only boundary.
+  The change-id machinery above covers it.
+- *Downward* (provider → engine): reconciliation against a truth we do
+  _not_ control — UIDVALIDITY rolls, Gmail `historyId` gaps, provider
+  re-keying. There is no clean monotonic counter handed to us here; we
+  reconstruct order from provider-specific anchors. This is the harder
+  problem, and it is _ours alone_ — it is what §Provenance, the channel
+  op log (§rule #4), and the `uidValidityRolled` / `syncTokenExpired`
+  error codes exist to handle. We do not paper the two boundaries
+  together: the upward token is authoritative for clients; the downward
+  state is forever a best-effort mirror of the provider.
 
 == Capability tokens
 Every request carries a `token` field. Today: opaque string, accepted,
@@ -1373,3 +1448,10 @@ express all of these cleanly is wrong.
   `Email`, `MessageState` → `EmailObject`, `Submission` →
   `EmailSubmission`. Webhook/method names follow: `message.received` →
   `email.received`, etc.
+- *2026-06-09* — Concretized the sync model (§State tokens & sync):
+  change-id as a monotonic `u64` per `(account, collection)`, append-only
+  changelog as a range-scannable subspace, `assert_state` as the named
+  mechanism behind `stateMismatch`, container-vs-item change streams
+  mapped onto the `Email`/`EmailObject` split, and the upward-vs-downward
+  two-boundary framing (client-as-server, not MTA). Adapted from
+  Stalwart's change-id machinery.
