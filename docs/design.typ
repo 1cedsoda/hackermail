@@ -1519,17 +1519,83 @@ remember:
 - *Cross-plugin distributed tracing*. We require trace ids on
   provenance now; full OpenTelemetry integration in Phase 5.
 
+= Prior Art: Stalwart
+
+== Why look at it
+Stalwart (Rust, JMAP-first, multi-backend storage) is the closest shipping
+system to our north star, so it is our richest source of _validated_
+mechanism. The essential caveat: _Stalwart is a full mail server (an MTA);
+we are a client-as-server._ It accepts mail from the internet over SMTP,
+filters it, and _owns_ the mailbox — it is the source of truth. We connect
+to existing providers (IMAP / Gmail / Graph), which remain the source of
+truth, and re-serve a unified projection to UIs and agents. So we adopt
+its _local-sync-engine + store_ half and ignore its _MTA-pipeline_ half.
+
+== What we adopt
+- *Change-id sync machinery* → §State tokens & sync. Monotonic `u64` per
+  `(account, collection)`, range-scannable changelog, `assert_state`
+  optimistic concurrency, container-vs-item split. This is the most
+  important borrow: sync _is_ our core job.
+- *Storage as separable roles* → §Four storage roles. Their
+  `Store` / `BlobStore` / `SearchStore` / `InMemoryStore` separation,
+  plus their `Ephemeral` store variant, is our metadata/blob/index/cache
+  split and our forgettable tier.
+- *Checked capability profiles* → §Deployment Profiles. Their
+  `ClusterRoles` boolean flags, validated before a service starts, become
+  our startup-asserted profile.
+- *Synchronous decision hooks* → §Two hook tiers. Their MTA-Hooks
+  (sync HTTP POST returning an action) become our interceptors, minus the
+  reject/quarantine verbs we cannot honor.
+- *Small wins:* `arc_swap`-style atomic Arc swap for hot-reloading the
+  plugin/registry config (resolves the hot-reload open question — it is
+  cheap, so: yes); a _pluggable_ cluster pub/sub abstraction defaulting to
+  in-process (resolves the event-bus open question — abstract it, default
+  `None`, let operators swap in NATS/Kafka); BLAKE3 as a blob-key hash.
+
+== What we deliberately reject
+- *Re-encrypt-at-rest on ingest.* Stalwart re-encrypts received cleartext
+  to the account key at ingest. We do the opposite (§Crypto): canonical
+  storage is the _wire form as transmitted_, never re-encrypted — to
+  preserve content-addressing, provenance, and provider round-trips, and
+  to treat lost-keys as the correct failure. "Encryption at rest" for us
+  means wire-form preservation, _not_ Stalwart-style re-encryption.
+- *The MTA pipeline.* SMTP-stage hooks, SPF/DKIM/DMARC/ARC inbound auth,
+  the outbound queue/DSN/retry spool, and the spam-filter stages are
+  source-of-truth concerns. We receive already-authenticated mail; outbound
+  retry/DSN lives _in_ a channel plugin, not core; spam is the provider's
+  job (a plugin may classify).
+- *Authoritative recipient resolution.* Their directory `recipient()`
+  decides "do I deliver to this address". Our `Address → Account` is the
+  lighter "which of _my linked_ accounts" — we are not the authoritative
+  recipient of internet mail. We take the _shape_ of their
+  `assert_has_access` permission check for our authz seam, not its
+  delivery semantics.
+
+== The asymmetry that is ours alone
+Stalwart has one sync boundary (it is the truth → push up to clients). We
+have two (§State tokens & sync, "Two boundaries"): the _upward_ one is
+identical to theirs and we copy it; the _downward_ one (provider → engine
+reconciliation: UIDVALIDITY rolls, `historyId` gaps, re-keying) is a
+problem Stalwart never faces and gives us nothing for. That downward
+half — provenance, the channel op log, `uidValidityRolled` /
+`syncTokenExpired` — is our own contribution, not borrowed.
+
 = Open Questions
 
 - Plugin language? (HTTP means any language; reference SDK in Rust + TS?)
-- Event bus: in-process pub/sub, NATS, or just webhooks all the way down?
 - How do plugins discover each other's namespace schemas at runtime?
-- Hot reload of plugins — required, or restart-acceptable for v1?
 - Migration story for metadata schema bumps.
 - Encrypted-at-rest: core concern or storage-plugin concern?
 - Threading algorithm as plugin — but threads are referenced by core. Who
   owns the canonical thread id?
-- Backpressure on webhooks (IMAP IDLE, large attachment streams).
+
+_Resolved (see §Prior Art):_
+- Event bus topology — _pluggable coordinator, default in-process_; NATS/
+  Kafka are opt-in operator choices, not core assumptions.
+- Hot reload — _yes, via atomic config/registry Arc swap_; cheap enough
+  that restart-only is not worth the limitation.
+- Webhook backpressure — _per-subscriber `lossy`/`lossless` drop policy_
+  plus the DLQ (§rule #6); a slow consumer cannot stall the bus.
 
 = Stress-test Scenarios
 
@@ -1625,3 +1691,10 @@ express all of these cleanly is wrong.
   per-subscriber `lossy`/`lossless` drop policy. Adapted the sync-hook
   shape from Stalwart's MTA-Hooks, with MTA verbs (reject/quarantine)
   stripped — a client-as-server cannot un-receive provider-accepted mail.
+- *2026-06-09* — Added Prior Art: Stalwart section framing it as MTA vs.
+  our client-as-server: what we adopt (sync machinery, storage roles,
+  profiles, sync hooks, hot-reload, pluggable pub/sub, BLAKE3), what we
+  reject (re-encrypt-at-rest, the MTA pipeline, authoritative recipient
+  resolution), and the downward-reconciliation asymmetry that is ours
+  alone. Retired the resolved open questions (event-bus topology, hot
+  reload, webhook backpressure).
