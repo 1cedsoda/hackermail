@@ -242,6 +242,19 @@ This split also makes encryption-at-rest tractable: encrypt `Email`
 bodies with per-account keys, leave `EmailObject` (which has no body)
 queryable.
 
+== AnalyzedDocument — a derived, transient artifact
+Distinct from both: the `AnalyzedDocument` is the normalized output of a
+single analysis pass over an `Email` — extracted plaintext per part,
+detected language, structured header fields, attachment-extracted text,
+and chunk boundaries. It is _derived_ (a pure function of `Email` content
++ analyzer version, hence content-addressed and computed once, shared
+across accounts) and _transient_ (it is not canonical state; it exists to
+feed Index Providers — see §Storage). Because it is the _plaintext_ of a
+possibly-encrypted body, it is `plaintext-tainted` and privileged exactly
+like a decrypted view (§Crypto): cacheable in the `cache` role only for
+non-encrypted mail, and behind the privileged-search capability otherwise.
+It is the sibling of the decrypted view, never of canonical storage.
+
 == Mailbox: folder or label?
 A `Mailbox` has a `semantics` field: `exclusive` (folder-like — an email
 in this mailbox is _not_ in another exclusive mailbox of the same account)
@@ -700,11 +713,38 @@ Standard event types (extensible):
 - `emailSubmission.transitioned` — state machine moved.
 - `mailbox.changed` — created / renamed / membership changed.
 - `crypto.envelope.detected` — see §Crypto.
+- `email.analyzed` — an `AnalyzedDocument` is ready for one `Email`
+  (see below). This is the fan-out point for Index Providers.
 - `account.*`, `identity.*`, `thread.*` — analogous.
 
 Events carry `{ type, accountId, ids, stateBefore, stateAfter, at,
 provenance }`. Subscribers can filter at subscribe time (`{ types,
 accountIds, mailboxIds }`).
+
+== Analyze once, index many
+With more than one derived index (FTS _and_ vectors _and_ …), the naive
+design has each Index Provider independently re-parse MIME, strip HTML,
+decrypt, and extract attachment text — the expensive work, redone per
+provider. Instead we factor the inbound enrichment into two stages, the
+standard analysis→indexing split:
+
++ *Analysis (once per `Email`).* A single analyzer subscriber turns raw
+  content into an `AnalyzedDocument` and emits `email.analyzed`.
++ *Indexing (per provider).* Index Providers subscribe to `email.analyzed`
+  — _not_ raw `email.received` — and each builds its own structure from
+  the shared document. Parse/extract/decrypt happens exactly once; adding
+  a provider adds a subscriber, not another extraction pass.
+
+```
+email.received (committed)
+  └─▶ analyzer ──produces──▶ AnalyzedDocument ──emits──▶ email.analyzed
+         ├─▶ FTS provider     (tokenize → inverted index)
+         ├─▶ vector provider  (chunk → embed → ANN index)
+         └─▶ facet provider   (extract fields → structured index)
+```
+
+Analysis runs _post-commit_ (it is expensive and must not block the
+inbound transaction), as the first subscriber after `email.received`.
 
 == Two hook tiers: interceptors vs. subscribers
 The event bus above is _post-commit_ and _fire-and-forget_: by the time
@@ -1769,3 +1809,8 @@ express all of these cleanly is wrong.
   account-scoped, `ext.hackermail.embedding` descriptor) and a single
   shared provider lifecycle (backfill/incremental/delete/reindex/gate/
   forgettable/degraded).
+- *2026-06-09* — Added the analyze-once spine: an `AnalyzedDocument`
+  (derived, content-addressed, transient/`plaintext-tainted` artifact,
+  sibling of the decrypted view) produced by a single post-commit analyzer
+  that emits an `email.analyzed` event; Index Providers fan out from that
+  rather than re-parsing/decrypting per provider.
