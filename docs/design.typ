@@ -610,6 +610,36 @@ Plus a few we add:
   [`Capability/list`], [What capabilities the current token grants (introspection).],
 )
 
+== Search: a provider-agnostic filter algebra
+`Email/query`'s `filter` is an _algebra_, not a fixed set of fields. Core
+defines the boolean structure (`AND`/`OR`/`NOT`) and the always-available
+structured predicates served by the `metadata` role (`inMailbox`, `from`,
+`receivedAt`, `inThread`, keywords, ranges). Every _other_ operator is
+contributed by an Index Provider (§Storage) that declared it via
+`index.analyzeSchema`:
+
+- `text`, `phrase` — from an FTS provider.
+- `semanticNear` — from a vector provider:
+  `{ "model": "openai/text-embedding-3-small@1", "text": "lunch plans",
+     "minScore": 0.78 }` (the engine routes `text → vector` through the
+  embedding plugin, then runs ANN).
+- future operators register the same way, no core change.
+
+Two rules make this safe rather than a free-for-all:
+
+- *Operators are capability-namespaced and declared in `using`.* A query
+  using `semanticNear` must declare `using: ["hackermail.vector@1"]`; the
+  engine rejects an undeclared or unsatisfiable operator at the envelope
+  boundary — exactly like crypto methods. This keeps the wire surface and
+  the conformance/golden-file tests well-defined even though operators are
+  extensible. A query's meaning never depends on _which plugins happen to
+  be loaded_ — it depends on the declared `using` set.
+- *Provider queries return ids WITH per-provider scores*, never a bare
+  ranked list. A `text` result carries its BM25-ish score, a
+  `semanticNear` result its similarity. Scores are what make ranking and
+  fusion possible (§Search: fusion); without them a caller could only
+  intersect, not rank.
+
 == Worked example — send an encrypted reply
 One round-trip, four chained calls:
 ```json
@@ -2015,3 +2045,8 @@ express all of these cleanly is wrong.
   and stated that "forgettable" forgets content but never the intake
   journal — otherwise the receive-only profile loses its crash/outage
   no-loss guarantee.
+- *2026-06-09* — Made `Email/query`'s `filter` a provider-agnostic algebra:
+  core structured predicates plus Index-Provider-contributed operators
+  (`text`, `semanticNear`, …) that are capability-namespaced + declared in
+  `using`, and that return ids _with per-provider scores_ so ranking and
+  fusion are possible.
