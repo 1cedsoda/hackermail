@@ -1550,6 +1550,107 @@ Run in parallel with the phases above:
 - *RFC process.* Changes to core entities or wire protocol go through a
   lightweight RFC, recorded in `rfcs/` next to this document.
 
+= Durability & Crash Recovery
+
+The interceptor model (§Two hook tiers) decides _before_ persistence, on a
+RAM-only artifact. That is efficient and privacy-preserving, but it raises
+the sharpest correctness question in the design: _if a plugin or the
+engine is down momentarily, do we lose mail or diverge?_ The answer must
+be no. This section states the invariant and the machinery that holds it.
+
+== The no-loss invariant
+_For every message a channel observes, exactly one of {committed,
+affirmatively-dropped-with-tombstone} eventually becomes durable —
+regardless of transient plugin or engine failure._
+
+RAM-only-before-persistence is _safe_ only because some durable copy
+exists elsewhere to replay from. What that copy is differs by channel, and
+the distinction is load-bearing.
+
+== Replayable vs. non-replayable channels
+Channels declare which they are; it decides whether RAM-only ingest is
+safe or whether a durable intake spool is mandatory.
+
+- *Replayable* (IMAP, Gmail, Graph — pull-based). The message still exists
+  _at the provider_ until we acknowledge it (advance the UID cursor /
+  `historyId`, or delete). The provider _is_ our write-ahead log; on crash
+  we re-fetch. RAM-only ingest is correct here on one condition:
+  *never advance the provider sync cursor until the ingest outcome is
+  durable.* Bumping the cursor before the keep/drop decision is durable
+  opens a crash window that loses the message.
+- *Non-replayable* (SMTP-in, webhook bridge, Matrix event — push-based).
+  The message arrives once; the source will not re-deliver. RAM-only
+  ingest loses mail on crash. These channels _must_ durably spool the raw
+  bytes on intake, _before_ interceptors run — the engine is the only
+  durable copy.
+
+General rule: _the engine never relinquishes the only durable copy of a
+message until its outcome is itself durable._
+
+== The intake journal (always durable)
+A small, always-durable journal keyed by the idempotency key already
+required of every inbound callback (§rule #1:
+`channel:mailbox:uidvalidity:uid`, `channel:historyId:gm_msgid`):
+
+```json
+{ "idempotencyKey": "...",
+  "provenance":     { /* channel, at, provider.* */ },
+  "state":          "received" | "decided" | "finalized",
+  "outcome":        "keep" | "drop" | null,
+  "rawRef":         "<spool-ref>"   // present only for non-replayable channels
+}
+```
+
+It holds _no body_ for replayable channels (re-fetch recovers it) and the
+spooled raw for non-replayable ones. It is the inbound analog of the
+post-commit DLQ + `Push/replay` (§rule #6), which today guards only the
+_upward_ (engine → subscriber) path; the journal guards the _downward_
+(provider → engine → decision) path that had no equivalent. It delivers
+three guarantees at once:
+
++ *Idempotent retry* — a re-delivered webhook hits an existing key, no
+  duplicate row, no double-fired notification.
++ *Crash recovery* — on restart, scan for any non-`finalized` record,
+  re-acquire the body (re-fetch for replayable / reload spool for
+  non-replayable), re-run interceptors. `finalized` keys are skipped.
++ *Plugin-down survival* — a message whose interceptor could not run sits
+  pending; it is _held_, not lost, and retried when the plugin returns
+  (the `defer` outcome, §Two hook tiers).
+
+== The `email.receive` lifecycle
+Persistence and the retention decision must not race. `email.receive`
+therefore has an explicit ordering:
+
+```
+record intake (durable id [+ spool if non-replayable])
+   → run interceptors (RAM body)
+      → keep:        commit Email/EmailObject  → finalize → advance cursor
+      → drop:        write tombstone           → finalize → advance cursor
+      → unavailable: leave pending (do NOT advance cursor) → retry
+```
+
+The provider cursor advances _only_ on `finalize`. Everything between
+intake and finalize is recoverable from the journal plus the durable
+source.
+
+== Perfect sync vs. zero retention — the dial
+The journal retains a content-free _fingerprint_ of every message,
+including dropped ones; that is exactly what buys exactly-once and
+crash-safety. A maximally-private sink may not want even that. So the
+journal is a profile dial (§Deployment Profiles):
+
+- `journal = durable` (default) — perfect sync: survives crash and plugin
+  outage, exactly-once notifications. Cost: durable message _fingerprints_
+  (never content).
+- `journal = none` — true zero retention, RAM-everything. Cost:
+  at-most-once; a crash may lose in-flight mail or double-fire on recovery.
+
+_You cannot have both perfect-sync and zero-retention_ — the journal is
+the thing that makes sync perfect, and it is itself a (small, content-free)
+retention. "Forgettable" applies to message _content_; the intake journal
+stays durable even when everything else is RAM-only. This is the precise
+form of "store message ids always".
+
 = Real-World Quirks & Defensive Invariants
 
 The model is now expressive enough that the hard problems are no longer
@@ -1880,3 +1981,11 @@ express all of these cleanly is wrong.
   "interceptor unavailable" from an affirmative `drop` — unavailability
   must _defer_ (hold uncommitted, don't advance the provider cursor),
   never discard; `fail-by-dropping` is forbidden.
+- *2026-06-09* — Added Durability & Crash Recovery section: the no-loss
+  invariant, replayable-vs-non-replayable channels (provider-as-WAL vs.
+  mandatory intake spool), the always-durable intake journal keyed by the
+  §rule #1 idempotency key (the downward-path analog of the DLQ/replay),
+  the explicit `email.receive` lifecycle (cursor advances only on
+  finalize), and the perfect-sync-vs-zero-retention dial
+  (`journal = durable` default; the journal stays durable even when
+  content is forgettable).
