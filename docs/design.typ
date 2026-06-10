@@ -640,6 +640,41 @@ Two rules make this safe rather than a free-for-all:
   fusion possible (§Search: fusion); without them a caller could only
   intersect, not rank.
 
+== Search: fusion (the planner is core)
+A real query is hybrid — _"in INBOX, from alice, semantically near 'lunch',
+containing 'invoice'"_ — touching the metadata, vector, and FTS providers
+at once. The engine provides a *fusion planner* (batteries-included, in
+core) so clients get a single blended ranking without each reinventing it:
+
++ Decompose the `filter` tree into leaf predicates.
++ Route each leaf to the provider that declared the operator (over-fetch
+  top-K from the ranked ones).
++ Collect per-provider scored id-sets; intersect/union per the boolean
+  structure (roaring bitmaps make this cheap).
++ _Fuse_ the surviving scores into one ranking and return ids +
+  `queryState`, paginated normally.
+
+The planner owns the fusion policy — reciprocal-rank-fusion by default,
+weights configurable per deployment. Because fusion is core, hybrid
+pagination and a single coherent `queryState` are the engine's
+responsibility, not the client's.
+
+Three modes, one surface:
+- *Single-factor* — a `filter` naming one operator. The owning provider
+  ranks; the planner is a pass-through.
+- *Engine-fused* (default) — a `filter` spanning several providers. The
+  planner blends, as above.
+- *Client-fused* (override) — a client that wants its _own_ relevance
+  issues the provider queries separately, reads the per-provider scores
+  (always exposed), and fuses itself. Reference fusion helpers (RRF,
+  weighted blend) live in the *SDK*, not core, so a client overrides the
+  default without the engine growing a second policy. Batched
+  backreferences (`#ids`) still let it intersect server-side in one
+  round-trip when it only needs filtering, not re-ranking.
+
+So: the engine ships one good fused ranking _and_ exposes the scored
+components, so the default is effortless and the override is free.
+
 == Worked example — send an encrypted reply
 One round-trip, four chained calls:
 ```json
@@ -2050,3 +2085,9 @@ express all of these cleanly is wrong.
   (`text`, `semanticNear`, …) that are capability-namespaced + declared in
   `using`, and that return ids _with per-provider scores_ so ranking and
   fusion are possible.
+- *2026-06-09* — Put the fusion planner in core (batteries-included): it
+  decomposes the filter, routes leaves to providers, and blends scored
+  id-sets into one ranking (RRF default, weights configurable), owning
+  hybrid pagination + `queryState`. Three modes — single-factor,
+  engine-fused (default), client-fused (override via exposed scores + SDK
+  helpers).
