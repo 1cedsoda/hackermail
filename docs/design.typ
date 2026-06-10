@@ -1236,23 +1236,34 @@ quote in the draft body. Mechanics:
 The draft is plaintext like any draft. The decision to encrypt the
 outbound reply is at `EmailSubmission` time, not before.
 
-== Search of encrypted bodies
-Default: encrypted bodies are not indexed. Header-level and
-metadata-level search continue to work (headers are plaintext, the
-`crypto` namespace is searchable).
+== Search, analysis & embeddings of encrypted bodies
+Default: encrypted bodies are neither analyzed, indexed, nor embedded.
+Header-level and metadata-level search continue to work (headers are
+plaintext, the `crypto` namespace is searchable).
 
-Opt-in: a _privileged search plugin_ may declare the capability
+This is _one_ rule covering every derived projection, not a per-feature
+exception. The `AnalyzedDocument` (§Domain Model) is the plaintext of a
+possibly-encrypted body, so it is `plaintext-tainted`; everything fed from
+it — FTS tokens, vectors/embeddings, facets — inherits that taint. An
+*embedding is as sensitive as the plaintext*: embedding-inversion can
+partially reconstruct text from a vector, so a vector of an encrypted body
+reintroduces exactly the leak this section prevents. Therefore analysis,
+indexing, _and_ embedding of encrypted content are gated identically.
+
+Opt-in: a _privileged_ analyzer/Index-Provider may declare the capability
 `email.decrypt:account=X` (today: stub-trusted; tomorrow: real
 enforcement). It then:
-+ Subscribes to `email.received`.
++ Subscribes to `email.received` (analyzer) or `email.analyzed` (index
+  providers).
 + For each encrypted `Email` matching the capability, requests the
-  decrypted view, indexes the plaintext.
-+ Stores the index in its own datastore, ideally encrypted at rest with
-  a key from the keystore (closes the loop — we don't reintroduce the
+  decrypted view, produces the `AnalyzedDocument` / index / vectors over
+  the plaintext.
++ Stores its structure in its own datastore, ideally encrypted at rest
+  with a key from the keystore (closes the loop — we don't reintroduce the
   leak we just avoided).
 
-We ship this plugin separately and off-by-default. Operators who want
-it opt in knowingly.
+We ship these privileged variants separately and off-by-default. Operators
+who want searchable/embeddable encrypted mail opt in knowingly.
 
 == Hard problems & where they live
 - *Key discovery & trust UX.* WKD lookup, keyserver fetch, Autocrypt
@@ -2091,3 +2102,9 @@ express all of these cleanly is wrong.
   hybrid pagination + `queryState`. Three modes — single-factor,
   engine-fused (default), client-fused (override via exposed scores + SDK
   helpers).
+- *2026-06-09* — Generalized the encrypted-body crypto gate to cover
+  analysis, indexing, _and_ embeddings as one rule (via the
+  `plaintext-tainted` `AnalyzedDocument`): an embedding is as sensitive as
+  the plaintext (inversion risk), so all derived projections over
+  encrypted content require the same privileged `email.decrypt` capability
+  and stay off by default.
