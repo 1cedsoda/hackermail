@@ -1190,6 +1190,83 @@ If a setting affects routing or security, it must be expressible in config
 (auditable). If it affects behavior, it must also be expressible via API
 (automatable). Code is a convenience layer over the API.
 
+= Deployment Profiles
+
+== Why profiles exist
+Useful deployments — a receive-only privacy mail-drop, a webhook bridge,
+a phishing-analysis sink — are today only _emergent_: you assemble them
+from three independent decisions (which channel plugins load, which
+storage variant, which token scopes) and nothing checks they are
+consistent. That is exactly the failure the §Configuration "security
+settings must be auditable" rule warns against. A _profile_ is a named,
+engine-asserted invariant over those decisions.
+
+Stalwart (an MTA) reaches the same need via `ClusterRoles` — a struct of
+boolean capability flags each service checks before starting (§Prior Art).
+We adopt the _shape_ (a checked capability declaration) at the scale of a
+client-as-server: a profile is a small config block the engine validates
+against the loaded plugin set _at startup_ and refuses to run if violated.
+
+== The receive-only, forgettable profile
+```toml
+[profile]
+name        = "receive-only-ephemeral"
+outbound    = false        # no EmailSubmission, no outbound channel plugin
+storage     = "ephemeral"  # metadata=in-memory+TTL, blob=null, index=off
+retention   = "60s"        # TTL for the forgettable metadata role
+```
+
+On startup the engine asserts:
+- _No outbound channel plugin is registered_ (else refuse to start). This
+  is the mechanism half — there is literally nothing to drive an
+  `EmailSubmission` past `pending`.
+- _No issued token carries `email.send` scope_ (§Authorization). This is
+  the policy half. "Receive-only" is enforced at _both_ layers, and the
+  profile is the single auditable place that asserts "this engine cannot
+  send" — which no single setting otherwise states.
+- _The storage role binding matches an ephemeral implementation_, so
+  "forgettable" is a checked property, not an accident.
+
+== Forgettable storage changes three semantics — state them, don't hide them
+A forgettable store quietly inverts guarantees the rest of the design
+assumes. The profile must pin the coupling rather than let it fail
+silently:
+
++ *Dedup collapses onto the TTL.* `rawHash`/`fingerprint` dedup (§Identity)
+  and the idempotency window (§rule #1, default 7 days) both assume the
+  store _remembers_ past arrivals. With a 60s TTL, the retention window
+  _is_ the dedup/idempotency window. The invariant:
+  `retention ≥ idempotencyWindow ≥ webhookMaxRetryHorizon`. Configure them
+  inconsistently and at-least-once delivery produces duplicates that
+  outlive the dedup memory.
++ *Sync/replay authority inverts.* `changes`, `queryChanges`, and
+  `Push/replay` (§rule #6) need a durable changelog to replay _from_. A
+  forgettable engine keeps only a bounded changelog tail, so it cannot
+  honor catch-up beyond the retention window. In this profile the
+  relationship flips: webhooks become _authoritative_ and best-effort,
+  the state-token catch-up model is bounded. Half the sync API
+  (`changes`/`Push/replay` past the window) is inert — the profile must
+  advertise this so clients do not assume durable replay.
++ *Annotation lifetime is bounded.* Metadata lives _on_ the object
+  (§Metadata blob), so evicting an `Email`/`EmailObject` evicts any
+  `ext.<namespace>` a subscriber wrote (AI classification, UI flags).
+  Therefore in this profile _subscribers must externalize anything they
+  want to keep_ — the engine is a transient pipe, not a store of record.
+
+== Forgetting deserves precise verbs
+We split `delete` into precise verbs (§Verbs) because "delete means too
+many things". _Forgetting_ earns the same scrutiny: it is either TTL
+eviction or never-stored, and either way it cascades from `Email` to its
+`EmailObject`s and their `ext` namespaces. A profile that forgets must
+say which, so "we forgot it" never silently means "we also dropped a
+subscriber's annotation it assumed was durable".
+
+== Other profiles (sketch)
+The same machinery names other shapes: `read-only-cache` (sync down, serve
+UIs, never mutate provider state), `archive-sink` (durable store, no
+outbound, no UI), `full` (everything, the default). Profiles are additive;
+none change core code.
+
 = Roadmap
 
 Phased plan. Each phase is shippable on its own and proves a specific
@@ -1494,3 +1571,10 @@ express all of these cleanly is wrong.
   monolithic. Made the changelog an explicit partition of the `metadata`
   role. Noted BLAKE3 as an acceptable blob-key hash (address, not
   signature). Adapted from Stalwart's store/blob/search/in-memory split.
+- *2026-06-09* — Added Deployment Profiles section: a profile is an
+  engine-asserted, startup-checked invariant over plugin set + storage
+  variant + token scope. Specified the `receive-only-ephemeral` profile
+  and pinned the three semantics forgettable storage silently inverts
+  (dedup↔TTL coupling, sync/replay authority inversion, bounded
+  annotation lifetime). Adapted the checked-capability shape from
+  Stalwart's `ClusterRoles`.
