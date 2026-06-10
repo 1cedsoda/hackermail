@@ -706,6 +706,46 @@ Events carry `{ type, accountId, ids, stateBefore, stateAfter, at,
 provenance }`. Subscribers can filter at subscribe time (`{ types,
 accountIds, mailboxIds }`).
 
+== Two hook tiers: interceptors vs. subscribers
+The event bus above is _post-commit_ and _fire-and-forget_: by the time
+`email.received` fires, the `Email` and `EmailObject` already exist. That
+is right for notify / index / AI-classify, but it cannot _shape_ an
+ingest — it can only react to one. We need a second, distinct tier.
+
++ *Interceptors* — _synchronous, ordered, pre-commit._ They run _inside_
+  the `email.receive` transaction and return a decision the engine acts
+  on before any write commits. Allowed verdicts:
+  - `transform` — rewrite/normalize the artifact (e.g. strip a tracking
+    pixel, canonicalize MIME) before it is stored.
+  - `annotate` — attach an `ext.<namespace>` record that lands atomically
+    with the row (e.g. a synchronous classification).
+  - `decide-retention` — `keep` | `drop`, the hook that lets a
+    forgettable sink (§Deployment Profiles) discard most mail _before_
+    writing, instead of store-then-evict.
++ *Subscribers* — _asynchronous, post-commit, at-least-once._ The
+  existing event bus. They observe committed state and cannot veto it.
+
+We borrow the _shape_ from Stalwart's MTA-Hooks (sync HTTP POST returning
+an action — §Prior Art) but strip the MTA verbs: as a client-as-server we
+receive _already-accepted_ mail from a provider, so there is no
+`reject`/`quarantine`/`bounce` — we cannot un-receive what the provider
+already holds. The meaningful pre-commit decision is not "refuse" but
+"transform / annotate / keep-or-drop".
+
+Discipline (so interceptors stay safe):
+- Interceptors are ordered and declared in config (auditable); a timeout
+  (§Plugin timeouts) fails the _ingest path open_ by default — a slow
+  interceptor must not silently swallow mail. The "fail open vs. fail
+  closed" choice per interceptor is a declared policy, not a default.
+- Only interceptors may block the inbound transaction. Everything optional
+  (indexing, AI, UI notify) stays a subscriber and runs after commit, per
+  the existing "never block the inbound path on optional plugins" rule
+  (§Plugin timeouts & degraded mode).
+- Subscriber delivery declares a drop policy — `lossless` (queue/retry to
+  the DLQ) or `lossy` (drop under backpressure) — so a slow UI consumer
+  cannot stall the bus. (Adapted from Stalwart's lossy/lossless
+  subscriber channels.)
+
 == State tokens & sync
 Every typed result carries a `state` field; clients pass it back to
 `changes` / `queryChanges` to receive deltas. State tokens are opaque
@@ -1578,3 +1618,10 @@ express all of these cleanly is wrong.
   (dedup↔TTL coupling, sync/replay authority inversion, bounded
   annotation lifetime). Adapted the checked-capability shape from
   Stalwart's `ClusterRoles`.
+- *2026-06-09* — Split the event surface into two tiers (§Event bus):
+  synchronous pre-commit _interceptors_ (`transform` / `annotate` /
+  `decide-retention`, including the keep-or-drop hook for forgettable
+  sinks) vs. the existing asynchronous post-commit _subscribers_. Added
+  per-subscriber `lossy`/`lossless` drop policy. Adapted the sync-hook
+  shape from Stalwart's MTA-Hooks, with MTA verbs (reject/quarantine)
+  stripped — a client-as-server cannot un-receive provider-accepted mail.
