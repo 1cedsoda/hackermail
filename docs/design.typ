@@ -753,15 +753,15 @@ is right for notify / index / AI-classify, but it cannot _shape_ an
 ingest — it can only react to one. We need a second, distinct tier.
 
 + *Interceptors* — _synchronous, ordered, pre-commit._ They run _inside_
-  the `email.receive` transaction and return a decision the engine acts
-  on before any write commits. Allowed verdicts:
+  the `email.receive` lifecycle, on a RAM-only artifact, and return a
+  decision the engine acts on before any write commits. Allowed verdicts:
   - `transform` — rewrite/normalize the artifact (e.g. strip a tracking
     pixel, canonicalize MIME) before it is stored.
   - `annotate` — attach an `ext.<namespace>` record that lands atomically
     with the row (e.g. a synchronous classification).
-  - `decide-retention` — `keep` | `drop`, the hook that lets a
-    forgettable sink (§Deployment Profiles) discard most mail _before_
-    writing, instead of store-then-evict.
+  - `decide-retention` — a _retention directive_, not a bit: the hook
+    that lets a forgettable sink (§Deployment Profiles) decide what to
+    keep _before_ writing, instead of store-then-evict.
 + *Subscribers* — _asynchronous, post-commit, at-least-once._ The
   existing event bus. They observe committed state and cannot veto it.
 
@@ -770,21 +770,80 @@ an action — §Prior Art) but strip the MTA verbs: as a client-as-server we
 receive _already-accepted_ mail from a provider, so there is no
 `reject`/`quarantine`/`bounce` — we cannot un-receive what the provider
 already holds. The meaningful pre-commit decision is not "refuse" but
-"transform / annotate / keep-or-drop".
+"transform / annotate / decide-retention".
+
+== Retention is a directive, not a bit
+"Store or not" is too coarse. The cheap, always-plaintext part (headers)
+and the large, often-encrypted part (body + attachments) deserve separate
+decisions, so `decide-retention` returns a directive over a lattice:
+
+```
+retention {
+  metadata: keep | drop      // EmailObject + headers (small, plaintext, queryable)
+  blob:     keep | drop      // raw body + attachments (large, often encrypted)
+  ttl:      duration | null  // forget after N — the per-message forgettable knob
+  reason:   string           // auditable cause; required when anything is dropped
+}
+```
+
+Gradient: `full` ▸ `headers-only` ▸ `ephemeral` ▸ `drop`. "Headers-only"
+is the common privacy/compliance shape — keep enough to thread, search,
+and show "mail from X about Y" without retaining content.
+
+- *Decision inputs are cheap by default.* Interceptors decide on envelope,
+  headers, size, and provenance — all plaintext, no body materialization.
+  A filter that needs body content is a _heavier_ interceptor that must
+  materialize/decrypt and is therefore capability-gated like privileged
+  search (§Crypto).
+- *Composition: most-restrictive-wins, under a profile ceiling.* Across
+  the interceptor chain the engine takes the lattice _minimum_ — any
+  interceptor may downgrade retention, none may upgrade past the
+  deployment profile's ceiling (§Deployment Profiles). A privacy `drop`
+  cannot be overridden by a "keep everything" archiver.
+- *`drop` ≠ "never happened".* A dropped artifact still flows through the
+  RAM-only pipe — interceptors run, a synchronous notify can fire — it
+  simply never lands in durable storage. (Post-commit subscribers, by
+  definition, do not see a never-committed artifact; "process-then-forget"
+  notification must be a _synchronous_ notify in the interceptor chain.)
+- *Blob retention is refcounted; metadata retention is per-account.*
+  Because `Email`/blobs are content-shared, `blob: drop` for one account
+  must not destroy another account's copy — the blob goes only when the
+  last referencing account drops it (the `expunge` vs `destroyEmail` split,
+  §Verbs).
+- *Never drop silently.* An affirmative drop writes a body-less
+  *tombstone* (`{at, channel, fingerprint, droppedBy, retention, reason,
+  cause: "policy.drop"}`) so "where did my mail go?" is answerable without
+  retaining content. This is §Provenance, inverted.
+
+== Unavailable is not "drop" (the durability rule for interceptors)
+The single most dangerous conflation: a retention interceptor being _down_
+is not the same as it deciding `drop`. Discard happens _only_ on an
+affirmative verdict — never because a plugin failed to answer. So the
+"fail open vs. fail closed" choice has three outcomes, and the broken one
+is forbidden:
+
+- *fail-open* — provisionally `keep` and commit now; reconcile when the
+  plugin returns. Never loses mail; may briefly store something policy
+  would have dropped.
+- *fail-closed (defer)* — hold the ingest _uncommitted_, do not advance
+  the provider sync cursor, retry with backoff (§Durability & Crash
+  Recovery). Never loses mail; ingest stalls while the plugin is down.
+- *fail-by-dropping* — _forbidden._ Absence of a decision must never
+  discard a message.
 
 Discipline (so interceptors stay safe):
-- Interceptors are ordered and declared in config (auditable); a timeout
-  (§Plugin timeouts) fails the _ingest path open_ by default — a slow
-  interceptor must not silently swallow mail. The "fail open vs. fail
-  closed" choice per interceptor is a declared policy, not a default.
-- Only interceptors may block the inbound transaction. Everything optional
+- Interceptors are ordered and declared in config (auditable). The
+  per-interceptor failure policy (`fail-open` | `defer`) is declared, and
+  defaults to whichever the deployment profile sets — never to discard.
+- Only interceptors may block the inbound lifecycle. Everything optional
   (indexing, AI, UI notify) stays a subscriber and runs after commit, per
-  the existing "never block the inbound path on optional plugins" rule
+  the "never block the inbound path on optional plugins" rule
   (§Plugin timeouts & degraded mode).
 - Subscriber delivery declares a drop policy — `lossless` (queue/retry to
   the DLQ) or `lossy` (drop under backpressure) — so a slow UI consumer
   cannot stall the bus. (Adapted from Stalwart's lossy/lossless
-  subscriber channels.)
+  subscriber channels.) Note this `lossy` is a _subscriber_ choice on
+  committed state; it never applies to the inbound retention decision.
 
 == State tokens & sync
 Every typed result carries a `state` field; clients pass it back to
@@ -1814,3 +1873,10 @@ express all of these cleanly is wrong.
   sibling of the decrypted view) produced by a single post-commit analyzer
   that emits an `email.analyzed` event; Index Providers fan out from that
   rather than re-parsing/decrypting per provider.
+- *2026-06-09* — Corrected the interceptor model: `decide-retention`
+  returns a directive over a lattice (`metadata`/`blob`/`ttl`), not a
+  keep/drop bit; composition is most-restrictive-wins under a profile
+  ceiling; drops write body-less tombstones. Critically, separated
+  "interceptor unavailable" from an affirmative `drop` — unavailability
+  must _defer_ (hold uncommitted, don't advance the provider cursor),
+  never discard; `fail-by-dropping` is forbidden.
